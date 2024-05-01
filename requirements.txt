@@ -1,0 +1,4 @@
+functions-framework==3.*
+google-cloud-logging
+box-sdk-gen[jwt] @ git+https://${GITHUB_TOKEN}github.com/shurrey/box-python-sdk-gen-ai.git
+boxsdk[jwt]
