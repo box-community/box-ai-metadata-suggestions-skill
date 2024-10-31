@@ -286,13 +286,8 @@ class box_util:
 
         if "docOwner" in data:
             docOwner = data["docOwner"]
-            if docOwner[0] != "[":
-                docOwner = f"[ {docOwner}"
-            
-            if docOwner[-1] != "]":
-                docOwner = f"{docOwner} ]"
-            
-            data["docOwner"] = docOwner
+            if type(docOwner) == str:
+                data["docOwner"] = [ docOwner ]
 
 
         self.logger.log_text(f"data {data}")
@@ -331,8 +326,8 @@ class box_util:
                 request_body=data,
             )
         except BoxAPIError as error_a:
-            self.logger.log_text(f"error_a {error_a}")
-            if error_a.status == 409:
+
+            if error_a.response_info.status_code == 409:
                 # Update the metadata
                 update_data = []
                 self.logger.log_text(f"Merge data")
@@ -353,7 +348,7 @@ class box_util:
                     )
                 except BoxAPIError as error_b:
                     self.logger.log_text(
-                        f"Error updating metadata: {error_b.status}:{error_b.code}:{file_id}"
+                        f"Error updating metadata: {error_b.response_info.status_code}::{file_id}::{error_b}"
                     )
             else:
                 raise error_a
