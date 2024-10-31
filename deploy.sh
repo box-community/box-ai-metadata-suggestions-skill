@@ -1,11 +1,11 @@
 #!/bin/bash
 
 cf_name=""
-cloud_functions=("oidc_login" "lti_launch" "auth_redirect" "box" "jwks")
+cloud_functions=("skill")
 
 function cf_deploy {
     cd $cf_name
-    gcloud functions deploy $cf_name --runtime python311 --trigger-http --allow-unauthenticated
+    gcloud functions deploy $cf_name --runtime python311 --trigger-http --allow-unauthenticated --env-vars-file .env.yaml
     cd ..
 }
 

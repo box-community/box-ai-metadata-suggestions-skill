@@ -1,43 +1,33 @@
+import base64
+import hashlib
+import hmac
 import os
-import datetime
+from datetime import datetime
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from box_sdk_gen.client import BoxClient
-from box_sdk_gen.developer_token_auth import BoxDeveloperTokenAuth
-from box_sdk_gen.jwt_auth import BoxJWTAuth, JWTConfig
-    
-from box_sdk_gen.utils import ByteStream
-
-from box_sdk_gen.fetch import APIException
-
-from box_sdk_gen.schemas import MetadataTemplate
-
-from box_sdk_gen.managers.metadata_templates import (
-    CreateMetadataTemplateSchemaFieldsArg, #CreateMetadataTemplateFields,
-    CreateMetadataTemplateSchemaFieldsArgTypeField, #CreateMetadataTemplateFieldsTypeField,
-    CreateMetadataTemplateSchemaFieldsArgOptionsField #CreateMetadataTemplateFieldsOptionsField
+from box_sdk_gen import (
+    AiExtractResponse,
+    AiItemBase,
+    BoxAPIError,
+    BoxClient,
+    BoxDeveloperTokenAuth,
+    BoxJWTAuth,
+    CreateAiExtractStructuredMetadataTemplate,
+    CreateMetadataTemplateFields,
+    CreateMetadataTemplateFieldsOptionsField,
+    CreateMetadataTemplateFieldsTypeField,
+    DeleteMetadataTemplateScope,
+    GetFileMetadataByIdScope,
+    GetMetadataTemplateScope,
+    JWTConfig,
+    MetadataTemplate,
+    UpdateFileMetadataByIdRequestBody,
+    UpdateFileMetadataByIdRequestBodyOpField,
+    UpdateFileMetadataByIdScope,
+    UpdateMetadataTemplateScope
 )
-
-from box_sdk_gen.managers.search import (
-    CreateMetadataQueryExecuteReadOrderByArg, #SearchByMetadataQueryOrderBy,
-    CreateMetadataQueryExecuteReadOrderByArgDirectionField #SearchByMetadataQueryOrderByDirectionField,
-)
-
-from box_sdk_gen.managers.file_metadata import (
-    CreateFileMetadataByIdScopeArg, #CreateFileMetadataByIdScope,
-    UpdateFileMetadataByIdScopeArg, #UpdateFileMetadataByIdScope,
-    UpdateFileMetadataByIdRequestBodyArg, #UpdateFileMetadataByIdRequestBody,
-    UpdateFileMetadataByIdRequestBodyArgOpField #UpdateFileMetadataByIdRequestBodyOpField,
-)
-
-from boxsdk import OAuth2, Client, JWTAuth
-from boxsdk.object.webhook import Webhook
-
-from ai_schemas import IntelligenceMetadataSuggestions
-from intelligence import IntelligenceManager
-
-ENTERPRISE_SCOPE="enterprise_899905961"
 
 class box_util:
 
@@ -53,26 +43,6 @@ class box_util:
         "UNKNOWN": 'skills_unknown_error'
     }
 
-    box_video_formats = set([
-        '.3g2',
-        '.3gp',
-        '.avi',
-        '.flv',
-        '.m2v',
-        '.m2ts',
-        '.m4v',
-        '.mkv',
-        '.mov',
-        '.mp4',
-        '.mpeg',
-        '.mpg',
-        '.ogg',
-        '.mts',
-        '.qt',
-        '.ts',
-        '.wmv'
-    ])
-
     def __init__(self, read_token, write_token, logger):
         self.logger = logger
 
@@ -80,61 +50,73 @@ class box_util:
         self.primary_key = os.environ.get('BOX_KEY_1', None)
         self.secondary_key = os.environ.get('BOX_KEY_2', None)
 
-        self.read_client = self.get_basic_client(read_token)
-        self.write_client = self.get_basic_client(write_token)
+        self.read_client = self._get_basic_client(read_token)
+        self.write_client = self._get_basic_client(write_token)
 
-        self.old_client = self.get_old_client(read_token)
+        self.jwt_client = self._get_jwt_client()
 
-        self.client = self.jwt_auth()
-
-        self.auth = ""
-
-        self.logger.log_text(f"client_id: {self.client_id} key1: {self.primary_key} key2: {self.secondary_key}")
-        
-    def get_basic_client(self,token):
+    def _get_basic_client(self,token):
 
         auth = BoxDeveloperTokenAuth(token=token)
 
         return BoxClient(auth)
     
-    def get_old_client(self,token):
+    def _get_jwt_client(self):
 
-        auth = OAuth2(
-            client_id=self.client_id, 
-            client_secret=self.primary_key,
-            access_token=token
-        )
+        jwt_config = JWTConfig.from_config_file(config_file_path="./metadata-extraction-jwt.json")
+        auth = BoxJWTAuth(config=jwt_config)
 
-        return Client(auth)
-
-    def is_launch_safe(self, body, headers):
-        self.logger.log_text(f"body {body}, headers {headers}, self.primary_key {self.primary_key}, self.secondary_key {self.secondary_key}")
-        return Webhook.validate_message(body, headers, self.primary_key, self.secondary_key)
+        return BoxClient(auth=auth)
     
-    def jwt_auth(self):
-        try:
-            jwt_config = JWTConfig.from_config_file(config_file_path='/config/box-ai-metadata-extraction-skill-jwt')
-            self.auth = BoxJWTAuth(config=jwt_config)
+    def is_launch_safe(self, body, headers):
+        primary_signature = self._compute_signature(body, headers, self.primary_key)
+        if primary_signature is not None and hmac.compare_digest(primary_signature, headers.get('box-signature-primary')):
+            return True
 
-            self.logger.log_text("instantiate client")
-            self.client = BoxClient(self.auth)
-        except Exception as e:
-            self.logger.log_text(f"Unable to instantiate Box SDK")
+        if self.secondary_key:
+            secondary_signature = self._compute_signature(body, headers, self.secondary_key)
+            if secondary_signature is not None and hmac.compare_digest(secondary_signature, headers.get('box-signature-secondary')):
+                return True
+            return False
 
+        return False
+    
+    def _compute_signature(self, body: bytes, headers: dict, signature_key: str) -> Optional[str]:
+        """
+        Computes the Hmac for the webhook notification given one signature key.
+
+        :param body:
+            The encoded webhook body.
+        :param headers:
+            The headers for the `Webhook` notification.
+        :param signature_key:
+            The `Webhook` signature key for this application.
+        :return:
+            An Hmac signature.
+        """
+        if signature_key is None:
+            return None
+        if headers.get('box-signature-version') != '1':
+            return None
+        if headers.get('box-signature-algorithm') != 'HmacSHA256':
+            return None
+
+        encoded_signature_key = signature_key.encode('utf-8')
+        encoded_delivery_time_stamp = headers.get('box-delivery-timestamp').encode('utf-8')
+        new_hmac = hmac.new(encoded_signature_key, digestmod=hashlib.sha256)
+        new_hmac.update(body + encoded_delivery_time_stamp)
+        signature = base64.b64encode(new_hmac.digest()).decode()
+        return signature
+    
     def get_template_by_key(self, template_key: str) -> MetadataTemplate:
         """Get a metadata template by key"""
 
-        scope = "enterprise"
-
-        if self.client is None:
-            self.jwt_auth()
-
         try:
-            template = self.client.metadata_templates.get_metadata_template_schema(
-                scope=scope, template_key=template_key
+            template = self.read_client.metadata_templates.get_metadata_template(
+                scope=GetMetadataTemplateScope.ENTERPRISE.value, template_key=template_key
             )
-        except APIException as err:
-            if err.status_code == 404:
+        except BoxAPIError as err:
+            if err.status == 404:
                 template = None
             else:
                 raise err
@@ -145,14 +127,12 @@ class box_util:
     def delete_template_by_key(self, template_key: str):
         """Delete a metadata template by key"""
 
-        scope = "enterprise"
-
         try:
-            self.client.metadata_templates.delete_metadata_template(
-                scope=scope, template_key=template_key
+            self.write_client.metadata_templates.delete_metadata_template(
+                scope=DeleteMetadataTemplateScope.ENTERPRISE.value, template_key=template_key
             )
-        except APIException as err:
-            if err.status_code == 404:
+        except BoxAPIError as err:
+            if err.status == 404:
                 pass
             else:
                 raise err
@@ -163,75 +143,120 @@ class box_util:
     ) -> MetadataTemplate:
         """Create a metadata template"""
 
-        scope = "enterprise"
-
         fields = []
 
-        # Document type
+        # Policy Name
         fields.append(
-            CreateMetadataTemplateSchemaFieldsArg(
-                type=CreateMetadataTemplateSchemaFieldsArgTypeField.ENUM,
-                key="documentType",
-                display_name="Document Type",
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.STRING,
+                key="policyName",
+                display_name="Policy Name"
+            )
+        )
+
+        # Policy Number
+        fields.append(
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.STRING,
+                key="policyNumber",
+                display_name="Policy Number",
+                description="example: \"BOX-POL-15\"",
+            )
+        )
+
+        # Policy Version
+        fields.append(
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.STRING,
+                key="policyVersion",
+                display_name="Policy Version",
+                description="example: \"BOX-POL-123.52\"",
+            )
+        )
+
+        # Revision
+        fields.append(
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.STRING,
+                key="revision",
+                display_name="Revision",
+                description="Revision is a number. Example: for \"BOX-POL-123.02\", the revision is \"123.02\"",
+            )
+        )
+
+        # Effective Date
+        fields.append(
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.DATE,
+                key="effectiveDate",
+                display_name="Effective Date",
+                description="Effective date is the last signature"
+            )
+        )
+
+        # Author
+        fields.append(
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.STRING,
+                key="author",
+                display_name="Author"
+            )
+        )
+
+        # Approvers
+        fields.append(
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.STRING,
+                key="approvers",
+                display_name="Approvers",
+                description="Names of people who signed as a string",
+            )
+        )
+
+        # Status
+        fields.append(
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.ENUM,
+                key="status",
+                display_name="Status",
                 options=[
-                    CreateMetadataTemplateSchemaFieldsArgOptionsField(key="Invoice"),
-                    CreateMetadataTemplateSchemaFieldsArgOptionsField(key="Purchase Order"),
-                    CreateMetadataTemplateSchemaFieldsArgOptionsField(key="Unknown"),
+                    CreateMetadataTemplateFieldsOptionsField(key="Approved"),
+                    CreateMetadataTemplateFieldsOptionsField(key="In Review"),
+                    CreateMetadataTemplateFieldsOptionsField(key="Signed"),
+                    CreateMetadataTemplateFieldsOptionsField(key="Expired"),
                 ],
             )
         )
 
-        # Date
+        # Review Date
         fields.append(
-            CreateMetadataTemplateSchemaFieldsArg(
-                type=CreateMetadataTemplateSchemaFieldsArgTypeField.DATE,
-                key="documentDate",
-                display_name="Document Date",
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.DATE,
+                key="reviewDate",
+                display_name="Review Date",
+                description="Review Date"
             )
         )
 
-        # Document total
+        # Doc Owner
         fields.append(
-            CreateMetadataTemplateSchemaFieldsArg(
-                type=CreateMetadataTemplateSchemaFieldsArgTypeField.STRING,
-                key="total",
-                display_name="Total: $",
-                description="Total: $",
+            CreateMetadataTemplateFields(
+                type=CreateMetadataTemplateFieldsTypeField.MULTISELECT,
+                key="docOwner",
+                display_name="Doc Owner",
+                description="if the document is related to company risk, then choose \"Aaron\". If the document is related to legal policies, choose \"David\"",
+                options=[
+                    CreateMetadataTemplateFieldsOptionsField(key="Physical Security"),
+                    CreateMetadataTemplateFieldsOptionsField(key="Enterprise Security"),
+                    CreateMetadataTemplateFieldsOptionsField(key="Compliance, GRC"),
+                    CreateMetadataTemplateFieldsOptionsField(key="Aaron"),
+                    CreateMetadataTemplateFieldsOptionsField(key="David"),
+                ],
             )
         )
 
-        # Supplier
-        fields.append(
-            CreateMetadataTemplateSchemaFieldsArg(
-                type=CreateMetadataTemplateSchemaFieldsArgTypeField.STRING,
-                key="vendor",
-                display_name="Vendor",
-                description="Vendor name or designation",
-            )
-        )
-
-        # Invoice number
-        fields.append(
-            CreateMetadataTemplateSchemaFieldsArg(
-                type=CreateMetadataTemplateSchemaFieldsArgTypeField.STRING,
-                key="invoiceNumber",
-                display_name="Invoice Number",
-                description="Document number or associated invoice",
-            )
-        )
-
-        # PO number
-        fields.append(
-            CreateMetadataTemplateSchemaFieldsArg(
-                type=CreateMetadataTemplateSchemaFieldsArgTypeField.STRING,
-                key="purchaseOrderNumber",
-                display_name="Purchase Order Number",
-                description="Document number or associated purchase order",
-            )
-        )
-
-        template = self.client.metadata_templates.create_metadata_template(
-            scope=scope,
+        template = self.write_client.metadata_templates.create_metadata_template(
+            scope=UpdateMetadataTemplateScope.ENTERPRISE.value,
             template_key=template_key,
             display_name=display_name,
             fields=fields,
@@ -242,70 +267,91 @@ class box_util:
 
     def get_metadata_suggestions_for_file(
         self, file_id: str, template_key: str
-    ) -> IntelligenceMetadataSuggestions:
-        self.logger.log_text(f"getting metadata suggestion")
-        intelligence = IntelligenceManager(logger=self.logger, auth=self.auth)
-        self.logger.log_text(f"IntelligenceManager instantiated")
-        return intelligence.intelligence_metadata_suggestion(
-            item=file_id,
-            scope=ENTERPRISE_SCOPE,
-            template_key=template_key,
-            confidence="experimental",
+    ) -> AiExtractResponse:
+        print(
+            f"file id {file_id} file_id_type {type(file_id)} "
+        )
+        return self.jwt_client.ai.create_ai_extract_structured(
+            [AiItemBase(id=file_id, type="file")],
+            metadata_template=CreateAiExtractStructuredMetadataTemplate(
+                template_key=template_key, scope=GetMetadataTemplateScope.ENTERPRISE.value
+            ),
         )
 
     def apply_template_to_file(
         self, file_id: str, template_key: str, data: Dict[str, str], existing_data: Dict[str,str]
     ):
-        self.logger.log_text(f"Applying template to file")
-       # remove empty values
+        # remove empty values
         data = {k: v for k, v in data.items() if v}
+
+        if "docOwner" in data:
+            docOwner = data["docOwner"]
+            if docOwner[0] != "[":
+                docOwner = f"[ {docOwner}"
+            
+            if docOwner[-1] != "]":
+                docOwner = f"{docOwner} ]"
+            
+            data["docOwner"] = docOwner
+
+
         self.logger.log_text(f"data {data}")
 
         # Check if data has a date
-        if "documentDate" in data:
+        if "effectiveDate" in data:
             try:
-                date_string = data["documentDate"]
-                date2 = datetime.fromisoformat(date_string)
-                data["documentDate"] = (
+                date_string = data["effectiveDate"]
+                date2 = datetime.fromisoformat(date_string).replace(hour=0).replace(minute=0).replace(second=0)
+                data["effectiveDate"] = (
                     date2.isoformat().replace("+00:00", "") + "Z"
                 )
             except ValueError:
-                data["documentDate"] = "1900-01-01T00:00:00Z"
+                data["effectiveDate"] = "1900-01-01T00:00:00Z"
+
+        # Check if data has a date
+        if "reviewDate" in data:
+            try:
+                date_string = data["reviewDate"]
+                date2 = datetime.fromisoformat(date_string).replace(hour=0).replace(minute=0).replace(second=0)
+                data["reviewDate"] = (
+                    date2.isoformat().replace("+00:00", "") + "Z"
+                )
+            except ValueError:
+                data["reviewDate"] = "1900-01-01T00:00:00Z"
 
         self.logger.log_text(f"merge data {data} and existing_data {existing_data}")
-        # Merge the default data with the data
-        #data = {**existing_data, **data}
-
+        
         try:
+
             self.logger.log_text(f"create file metadata")
-            self.client.file_metadata.create_file_metadata_by_id(
+            self.write_client.file_metadata.create_file_metadata_by_id(
                 file_id=file_id,
-                scope=CreateFileMetadataByIdScopeArg.ENTERPRISE,
+                scope=UpdateMetadataTemplateScope.ENTERPRISE,
                 template_key=template_key,
                 request_body=data,
             )
-        except APIException as error_a:
+        except BoxAPIError as error_a:
             self.logger.log_text(f"error_a {error_a}")
-            if error_a.status_code == 409:
+            if error_a.status == 409:
                 # Update the metadata
                 update_data = []
                 self.logger.log_text(f"Merge data")
                 for key, value in data.items():
-                    update_item = UpdateFileMetadataByIdRequestBodyArg(
-                        op=UpdateFileMetadataByIdRequestBodyArgOpField.ADD,
+                    update_item = UpdateFileMetadataByIdRequestBody(
+                        op=UpdateFileMetadataByIdRequestBodyOpField.REPLACE.value,
                         path=f"/{key}",
                         value=value,
                     )
                     update_data.append(update_item)
                 try:
                     self.logger.log_text(f"try to update data again.")
-                    self.client.file_metadata.update_file_metadata_by_id(
+                    self.write_client.file_metadata.update_file_metadata_by_id(
                         file_id=file_id,
-                        scope=UpdateFileMetadataByIdScopeArg.ENTERPRISE,
+                        scope=UpdateFileMetadataByIdScope.ENTERPRISE.value,
                         template_key=template_key,
                         request_body=update_data,
                     )
-                except APIException as error_b:
+                except BoxAPIError as error_b:
                     self.logger.log_text(
                         f"Error updating metadata: {error_b.status}:{error_b.code}:{file_id}"
                     )
@@ -318,7 +364,7 @@ class box_util:
         try:
             metadata = self.client.file_metadata.get_file_metadata_by_id(
                 file_id=file_id,
-                scope=CreateFileMetadataByIdScopeArg.ENTERPRISE,
+                scope=GetFileMetadataByIdScope.ENTERPRISE,
                 template_key=template_key,
             )
             return metadata
@@ -335,7 +381,7 @@ class box_util:
     ):
         """Search for files with metadata"""
 
-        from_ = ENTERPRISE_SCOPE + "." + template_key
+        from_ = GetFileMetadataByIdScope.ENTERPRISE.value + "." + template_key
 
         if order_by is None:
             order_by = [
